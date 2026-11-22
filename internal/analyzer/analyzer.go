@@ -18,11 +18,45 @@ const (
 )
 
 type Analyzer struct {
-	pricing pricing.Provider
+	pricing         pricing.Provider
+	percentile      float64
+	minObservedSpan time.Duration
 }
 
-func New(p pricing.Provider) *Analyzer {
-	return &Analyzer{pricing: p}
+// Option customises estimator behaviour without changing the existing Analyze
+// contract. With no options, the analyzer reproduces prior output: every
+// pre-existing field keeps its meaning and the new estimate defaults to p95.
+type Option func(*Analyzer)
+
+// WithPercentile selects the usage percentile used to derive reference
+// requests. Values outside the supported presets are rejected by the CLI; the
+// collector supplies the matching percentile through ClusterInfo.
+func WithPercentile(p float64) Option {
+	return func(a *Analyzer) {
+		if p > 0 {
+			a.percentile = p
+		}
+	}
+}
+
+// WithMinObservedSpan sets the minimum metric coverage required before a pod's
+// percentile usage is trusted. Zero disables the check.
+func WithMinObservedSpan(d time.Duration) Option {
+	return func(a *Analyzer) {
+		a.minObservedSpan = d
+	}
+}
+
+func New(p pricing.Provider, opts ...Option) *Analyzer {
+	a := &Analyzer{
+		pricing:         p,
+		percentile:      collector.DefaultPercentile,
+		minObservedSpan: DefaultMinObservedSpan,
+	}
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a
 }
 
 func (a *Analyzer) Analyze(ctx context.Context, info *collector.ClusterInfo) (*CostReport, error) {
@@ -162,7 +196,47 @@ func (a *Analyzer) Analyze(ctx context.Context, info *collector.ClusterInfo) (*C
 		report.InefficientPods = sorted
 	}
 
+	if hasPrometheus {
+		report.WasteEstimate = a.estimateWaste(info, allPods)
+	}
+
 	return report, nil
+}
+
+// estimateWaste builds the request-above-observation estimate. Requests come
+// from PodEfficiency (already unit-normalised); the reference is the observed
+// percentile times the shared headroom factor. Pods skipped by
+// calculatePodEfficiencies (zero CPU and memory request, including init-only
+// containers) never enter allPods and are reported as a count only.
+func (a *Analyzer) estimateWaste(info *collector.ClusterInfo, allPods []PodEfficiency) *WasteEstimate {
+	percentile := a.percentile
+	if info.Percentile > 0 {
+		percentile = info.Percentile
+	}
+
+	est := EstimateWaste(allPods, WasteConfig{
+		Period:          info.Period,
+		Percentile:      percentile,
+		Factor:          HeadroomFactor,
+		MinObservedSpan: a.minObservedSpan,
+	})
+
+	for _, node := range info.Nodes {
+		est.SkippedPods += countSkippedPods(node.Pods)
+	}
+	return est
+}
+
+// countSkippedPods mirrors the skip rule in calculatePodEfficiencies: a pod
+// with neither CPU nor memory requested is not analysed.
+func countSkippedPods(pods []collector.PodInfo) int {
+	var n int
+	for _, p := range pods {
+		if p.CPURequest == 0 && p.MemoryRequest == 0 {
+			n++
+		}
+	}
+	return n
 }
 
 func hasPrometheusMetrics(nodes []collector.NodeInfo) bool {
@@ -288,6 +362,9 @@ func calculatePodEfficiencies(pods []collector.PodInfo, np *pricing.NodePricing,
 			MemoryP95Usage:  pod.MemoryP95Usage,
 			CPUP95Available: pod.CPUP95Available,
 			MemP95Available: pod.MemP95Available,
+			CPUUnitPrice:    np.CPUCostPerCore,
+			RAMUnitPrice:    np.RAMCostPerGiB,
+			ObservedSpan:    pod.ObservedSpan,
 		})
 	}
 

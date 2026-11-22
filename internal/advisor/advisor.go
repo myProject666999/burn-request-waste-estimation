@@ -169,6 +169,13 @@ var recommendationSchema = anthropic.ToolInputSchemaParam{
 	Required: []string{"summary", "recommendations"},
 }
 
+func usagePercentileLabel(report *analyzer.CostReport) string {
+	if report.WasteEstimate != nil && report.WasteEstimate.Percentile > 0 {
+		return fmt.Sprintf("p%g", report.WasteEstimate.Percentile*100)
+	}
+	return "p95"
+}
+
 func buildPrompt(report *analyzer.CostReport) string {
 	data, _ := json.MarshalIndent(report, "", "  ")
 
@@ -343,10 +350,10 @@ func (a *Advisor) buildAskPrompt(report *analyzer.CostReport, question string, e
 		for _, p := range report.InefficientPods {
 			var parts []string
 			if p.CPUP95Available && p.CPUP95Usage > 0 {
-				parts = append(parts, fmt.Sprintf("CPU %dm (p95×1.5, rounded up)", int64(math.Ceil(p.CPUP95Usage*1.5*1000))))
+				parts = append(parts, fmt.Sprintf("CPU %dm (%s×%g, rounded up)", int64(math.Ceil(p.CPUP95Usage*analyzer.HeadroomFactor*1000)), usagePercentileLabel(report), analyzer.HeadroomFactor))
 			}
 			if p.MemP95Available && p.MemoryP95Usage > 0 {
-				parts = append(parts, fmt.Sprintf("MEM %dMi (p95×1.5, rounded up)", int64(math.Ceil(float64(p.MemoryP95Usage)*1.5/1048576))))
+				parts = append(parts, fmt.Sprintf("MEM %dMi (%s×%g, rounded up)", int64(math.Ceil(float64(p.MemoryP95Usage)*analyzer.HeadroomFactor/1048576)), usagePercentileLabel(report), analyzer.HeadroomFactor))
 			}
 			if len(parts) > 0 {
 				lines = append(lines, fmt.Sprintf("• %s/%s: recommend %s", p.Namespace, p.Name, strings.Join(parts, ", ")))

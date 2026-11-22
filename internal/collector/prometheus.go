@@ -24,12 +24,14 @@ type PrometheusClient struct {
 	baseURL    string
 	httpClient *http.Client
 	period     string
+	percentile float64
 }
 
 func NewPrometheusClient(baseURL, period string) *PrometheusClient {
 	return &PrometheusClient{
-		baseURL: baseURL,
-		period:  period,
+		baseURL:    baseURL,
+		period:     period,
+		percentile: DefaultPercentile,
 		httpClient: &http.Client{
 			Timeout: 2 * time.Minute,
 			Transport: &http.Transport{
@@ -38,6 +40,22 @@ func NewPrometheusClient(baseURL, period string) *PrometheusClient {
 			},
 		},
 	}
+}
+
+// SetPercentile selects the preset used by the percentile queries. The caller
+// validates the value against the supported presets.
+func (p *PrometheusClient) SetPercentile(v float64) {
+	if v > 0 {
+		p.percentile = v
+	}
+}
+
+// Percentile returns the preset used by the percentile queries.
+func (p *PrometheusClient) Percentile() float64 {
+	if p.percentile <= 0 {
+		return DefaultPercentile
+	}
+	return p.percentile
 }
 
 func (p *PrometheusClient) wrapQuery(query string) string {
@@ -237,15 +255,41 @@ func (p *PrometheusClient) GetPodMemoryUsage(ctx context.Context) (map[string]in
 }
 
 func (p *PrometheusClient) wrapQuantileQuery(query string, quantile float64) string {
-	if p.period == "" {
-		return query
+	return percentileQuery(query, p.period, quantile)
+}
+
+// Base pod expressions. The percentile and coverage queries both build on these
+// so CPU and memory are not assembled from two separate hand-written strings.
+const (
+	podCPUUsageExpr = `sum(rate(container_cpu_usage_seconds_total{container!="",container!="POD"}[5m])) by (pod, namespace)`
+	podMemUsageExpr = `sum(container_memory_working_set_bytes{container!="",container!="POD"}) by (pod, namespace)`
+)
+
+// subqueryStep is the fixed step used for all range aggregations.
+const subqueryStep = "5m"
+
+// percentileQuery is the single builder shared by CPU and memory. It only
+// varies the percentile parameter; the expression and 5m subquery step match
+// wrapQuantileQuery so all percentile queries stay consistent.
+func percentileQuery(base string, period string, percentile float64) string {
+	if period == "" {
+		return base
 	}
-	return fmt.Sprintf("quantile_over_time(%g, %s[%s:5m])", quantile, query, p.period)
+	return fmt.Sprintf("quantile_over_time(%g, %s[%s:%s])", percentile, base, period, subqueryStep)
+}
+
+// coverageQuery counts how many 5m evaluation points in the window carry a
+// sample for either resource, giving the pod's observed metric span. It uses the
+// same subquery step as the percentile queries.
+func coverageQuery(period string) string {
+	if period == "" {
+		return ""
+	}
+	return fmt.Sprintf("count_over_time((%s or %s)[%s:%s]) * 300", podCPUUsageExpr, podMemUsageExpr, period, subqueryStep)
 }
 
 func (p *PrometheusClient) GetPodCPUUsageP95(ctx context.Context) (map[string]float64, error) {
-	baseQuery := `sum(rate(container_cpu_usage_seconds_total{container!="",container!="POD"}[5m])) by (pod, namespace)`
-	query := p.wrapQuantileQuery(baseQuery, 0.95)
+	query := percentileQuery(podCPUUsageExpr, p.period, p.Percentile())
 	results, err := p.Query(ctx, query)
 	if err != nil {
 		return nil, err
@@ -267,8 +311,7 @@ func (p *PrometheusClient) GetPodCPUUsageP95(ctx context.Context) (map[string]fl
 }
 
 func (p *PrometheusClient) GetPodMemoryUsageP95(ctx context.Context) (map[string]int64, error) {
-	baseQuery := `sum(container_memory_working_set_bytes{container!="",container!="POD"}) by (pod, namespace)`
-	query := p.wrapQuantileQuery(baseQuery, 0.95)
+	query := percentileQuery(podMemUsageExpr, p.period, p.Percentile())
 	results, err := p.Query(ctx, query)
 	if err != nil {
 		return nil, err
@@ -287,6 +330,41 @@ func (p *PrometheusClient) GetPodMemoryUsageP95(ctx context.Context) (map[string
 		}
 	}
 	return usage, nil
+}
+
+// GetPodObservedSpans reports the metric coverage window per pod (namespace/pod)
+// in seconds, capped at the analysis window. Pods created by a recent rollout
+// have a shorter span and must not be treated as if observed for the full period.
+func (p *PrometheusClient) GetPodObservedSpans(ctx context.Context) (map[string]time.Duration, error) {
+	query := coverageQuery(p.period)
+	if query == "" {
+		return nil, nil
+	}
+	results, err := p.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	maxSeconds := PeriodToDays(p.period) * 86400
+
+	spans := make(map[string]time.Duration)
+	for _, r := range results {
+		pod := r.Metric["pod"]
+		ns := r.Metric["namespace"]
+		if pod == "" || ns == "" {
+			continue
+		}
+		val, err := parseValue(r.Value)
+		if err != nil {
+			continue
+		}
+		seconds := val
+		if maxSeconds > 0 && seconds > maxSeconds {
+			seconds = maxSeconds
+		}
+		spans[ns+"/"+pod] = time.Duration(seconds) * time.Second
+	}
+	return spans, nil
 }
 
 // CheckDataRange queries prometheus_tsdb_lowest_timestamp_seconds to determine

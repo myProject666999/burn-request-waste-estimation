@@ -67,6 +67,9 @@ burn analyze --prometheus http://prometheus:9090
 # 7-day average
 burn analyze --prometheus http://prometheus:9090 --period 7d
 
+# Over-request estimate at a different usage percentile (p50|p90|p95|p99)
+burn analyze --prometheus http://prometheus:9090 --period 7d --percentile p90
+
 # Drill into a namespace
 burn analyze --prometheus http://prometheus:9090 --namespace argocd
 

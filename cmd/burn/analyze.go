@@ -41,6 +41,7 @@ var (
 	gpuPrice      float64
 	storagePrice  float64
 	showSpot      bool
+	percentile    string
 )
 
 var analyzeCmd = &cobra.Command{
@@ -61,6 +62,7 @@ func init() {
 	f.BoolVar(&sendToSlack, "slack", false, "send report to Slack")
 	f.StringVar(&slackWebhook, "slack-webhook", "", "Slack webhook URL (or set SLACK_WEBHOOK_URL)")
 	f.StringVar(&period, "period", "", "analysis period (e.g. 1h, 7d, 30d)")
+	f.StringVar(&percentile, "percentile", "p95", "usage percentile for waste estimation (p50|p90|p95|p99)")
 	f.Float64Var(&cpuPrice, "cpu-price", 0, "custom CPU price per core per hour (on-prem)")
 	f.Float64Var(&ramPrice, "ram-price", 0, "custom RAM price per GiB per hour (on-prem)")
 	f.Float64Var(&gpuPrice, "gpu-price", 0, "custom GPU price per unit per hour (on-prem)")
@@ -81,6 +83,11 @@ func runAnalyze(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("invalid period %q: use Prometheus duration format (e.g. 1h, 7d, 30d)", period)
 	}
 
+	quantile, err := collector.ParsePercentile(percentile)
+	if err != nil {
+		return err
+	}
+
 	if withAI && period == "" {
 		fmt.Fprintln(os.Stderr, "Note: --ai without --period uses instant metrics. Add --period 7d for P95-based recommendations.")
 	}
@@ -98,7 +105,8 @@ func runAnalyze(cmd *cobra.Command, _ []string) error {
 		collectNS = ""
 	}
 
-	coll, err := collector.New(kubeconfig, kubecontext, collectNS, prometheusURL, period)
+	coll, err := collector.New(kubeconfig, kubecontext, collectNS, prometheusURL, period,
+		collector.WithPercentile(quantile))
 	if err != nil {
 		return err
 	}
@@ -130,7 +138,7 @@ func runAnalyze(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	report, err := analyzer.New(pp).Analyze(ctx, info)
+	report, err := analyzer.New(pp, analyzer.WithPercentile(quantile)).Analyze(ctx, info)
 	if err != nil {
 		return err
 	}
@@ -294,6 +302,10 @@ func outputTable(report *analyzer.CostReport) {
 		outputNamespaceSummary(report.Namespaces, hasPrometheus, report.MonthlyCost, report.TotalIdleCost)
 	}
 
+	if report.WasteEstimate != nil {
+		outputWasteEstimate(report.WasteEstimate)
+	}
+
 	if len(report.PVCosts) > 0 {
 		fmt.Println("\nSTORAGE")
 		fmt.Println("───────")
@@ -363,6 +375,35 @@ func outputTable(report *analyzer.CostReport) {
 	fmt.Printf("Network:         $%.2f\n", report.TotalNetworkCost)
 	fmt.Printf("Total:           $%.2f\n", report.TotalMonthlyCost)
 
+}
+
+func outputWasteEstimate(w *analyzer.WasteEstimate) {
+	fmt.Println("\nOVER-REQUEST ESTIMATE")
+	fmt.Println("────────────────────")
+	window := w.Period
+	if window == "" {
+		window = "instant"
+	}
+	fmt.Printf("Window: %s | Percentile: %s | Factor: %.2f | Monthly: $%.2f\n",
+		window, collector.FormatPercentile(w.Percentile), w.Factor, w.MonthlyWaste)
+	fmt.Printf("  CPU: $%.2f | Memory: $%.2f | per-pod sum: $%.2f\n",
+		w.CPUWasteMonthly, w.MemWasteMonthly, w.PerPodSumMonthly)
+
+	if len(w.Namespaces) > 0 {
+		fmt.Println()
+		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "NAMESPACE\tWORKLOADS\tWASTE/MO\tPER-POD SUM\tDIFF")
+		for _, ns := range w.Namespaces {
+			fmt.Fprintf(tw, "%s\t%d\t$%.2f\t$%.2f\t$%.2f\n",
+				ofmt.Truncate(ns.Namespace, 25), ns.Workloads, ns.MonthlyWaste, ns.PerPodSumMonthly, ns.Difference)
+		}
+		tw.Flush()
+	}
+
+	fmt.Printf("\nNot estimated: %d pods (CPU unavailable: %d, memory unavailable: %d, short sample: %d, GPU: %d)\n",
+		w.NotEstimatedPods, w.UnavailableCPU, w.UnavailableMem, w.InsufficientSamples, w.GPUPods)
+	fmt.Printf("Under-requested (zero waste, not offset): CPU %d, memory %d | Skipped (no requests): %d\n",
+		w.UnderRequestedCPU, w.UnderRequestedMem, w.SkippedPods)
 }
 
 func outputNamespaceSummary(namespaces []analyzer.NamespaceCost, hasPrometheus bool, monthlyCost, idleCost float64) {

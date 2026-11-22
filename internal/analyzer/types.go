@@ -30,6 +30,10 @@ type CostReport struct {
 	// Spot readiness
 	SpotReadiness []SpotReadiness `json:"spot_readiness,omitempty"`
 	SpotSavings   float64         `json:"spot_savings,omitempty"`
+
+	// WasteEstimate is the additive request-above-observation estimate. It does
+	// not change the meaning of IdleCost, InefficientPods, or PotentialSavings.
+	WasteEstimate *WasteEstimate `json:"waste_estimate,omitempty"`
 }
 
 type NodeCost struct {
@@ -79,6 +83,14 @@ type PodEfficiency struct {
 	MemoryP95Usage  int64   `json:"mem_p95_usage,omitempty"` // p95 memory usage in bytes
 	CPUP95Available bool    `json:"-"`
 	MemP95Available bool    `json:"-"`
+	// Per-unit hourly rates from the owning node's pricing, used to price
+	// request-above-observation waste. Units: $/core/hour and $/GiB/hour.
+	CPUUnitPrice float64 `json:"-"`
+	RAMUnitPrice float64 `json:"-"`
+	// ObservedSpan is the metric coverage window for this pod's percentile
+	// values (zero when unknown). Short spans flag rolling-update pods whose
+	// sample cannot stand in for the full analysis period.
+	ObservedSpan time.Duration `json:"-"`
 }
 
 type NamespaceCost struct {

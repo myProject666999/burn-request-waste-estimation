@@ -45,10 +45,11 @@ type PodInfo struct {
 	GPURequest      int64 // nvidia.com/gpu
 	CPUUsage        float64
 	MemoryUsage     int64
-	CPUP95Usage     float64 // p95 CPU usage in cores (over analysis period)
-	MemoryP95Usage  int64   // p95 memory usage in bytes (over analysis period)
-	CPUP95Available bool    // true if P95 query returned data for this pod
-	MemP95Available bool    // true if P95 query returned data for this pod
+	CPUP95Usage     float64       // selected-percentile CPU usage in cores (over analysis period; default p95)
+	MemoryP95Usage  int64         // selected-percentile memory usage in bytes (over analysis period; default p95)
+	CPUP95Available bool          // true if the percentile query returned data for this pod
+	MemP95Available bool          // true if the percentile query returned data for this pod
+	ObservedSpan    time.Duration // metric coverage span for this pod (0 when unknown)
 }
 
 type PVCInfo struct {
@@ -89,4 +90,9 @@ type ClusterInfo struct {
 	PVCs          []PVCInfo
 	LoadBalancers []LBServiceInfo
 	Workloads     []WorkloadInfo
+
+	// Effective analysis window after retention validation (may be shorter than
+	// the requested period) and the percentile used for usage metrics.
+	Period     string
+	Percentile float64
 }

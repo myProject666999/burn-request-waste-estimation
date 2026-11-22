@@ -7,6 +7,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 	appsv1 "k8s.io/api/apps/v1"
@@ -26,7 +27,21 @@ type Collector struct {
 	namespace  string
 }
 
-func New(kubeconfig, kubecontext, namespace, prometheusURL, period string) (*Collector, error) {
+// Option customises the collector. New keeps its positional signature so
+// existing callers are unaffected; options are additive.
+type Option func(*Collector)
+
+// WithPercentile selects the usage percentile for pod metrics. The caller must
+// validate the value against SupportedPercentiles.
+func WithPercentile(p float64) Option {
+	return func(c *Collector) {
+		if c.prometheus != nil {
+			c.prometheus.SetPercentile(p)
+		}
+	}
+}
+
+func New(kubeconfig, kubecontext, namespace, prometheusURL, period string, opts ...Option) (*Collector, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if kubeconfig != "" {
 		loadingRules.ExplicitPath = kubeconfig
@@ -57,6 +72,10 @@ func New(kubeconfig, kubecontext, namespace, prometheusURL, period string) (*Col
 
 	if prometheusURL != "" {
 		c.prometheus = NewPrometheusClient(prometheusURL, period)
+	}
+
+	for _, opt := range opts {
+		opt(c)
 	}
 
 	return c, nil
@@ -319,6 +338,8 @@ func (c *Collector) Collect(ctx context.Context) (*ClusterInfo, error) {
 		PVCs:          pvcInfos,
 		LoadBalancers: lbInfos,
 		Workloads:     workloads,
+		Period:        c.Period(),
+		Percentile:    c.Percentile(),
 	}, nil
 }
 
@@ -328,6 +349,14 @@ func (c *Collector) Period() string {
 		return c.prometheus.period
 	}
 	return ""
+}
+
+// Percentile returns the usage percentile used for pod metrics.
+func (c *Collector) Percentile() float64 {
+	if c.prometheus != nil {
+		return c.prometheus.Percentile()
+	}
+	return DefaultPercentile
 }
 
 func (c *Collector) validatePeriod(ctx context.Context) {
@@ -362,6 +391,7 @@ func (c *Collector) enrichWithMetrics(ctx context.Context, nodes []NodeInfo) {
 		podMem    map[string]int64
 		podCPUP95 map[string]float64
 		podMemP95 map[string]int64
+		podSpans  map[string]time.Duration
 	)
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -420,6 +450,15 @@ func (c *Collector) enrichWithMetrics(ctx context.Context, nodes []NodeInfo) {
 			}
 			return nil
 		})
+
+		g.Go(func() error {
+			var err error
+			podSpans, err = c.prometheus.GetPodObservedSpans(gctx)
+			if err != nil {
+				log.Printf("warning: failed to get pod metric coverage: %v", err)
+			}
+			return nil
+		})
 	}
 
 	_ = g.Wait()
@@ -467,6 +506,9 @@ func (c *Collector) enrichWithMetrics(ctx context.Context, nodes []NodeInfo) {
 			if mem, ok := podMemP95[key]; ok {
 				pod.MemoryP95Usage = mem
 				pod.MemP95Available = true
+			}
+			if span, ok := podSpans[key]; ok {
+				pod.ObservedSpan = span
 			}
 		}
 	}

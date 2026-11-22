@@ -135,7 +135,7 @@ func calculatePodRightSizingSavings(report *analyzer.CostReport) *SavingsOpportu
 		// CPU: recommend only when P95 was measured and is positive
 		if pod.CPUP95Available && pod.CPUP95Usage > 0 &&
 			pod.CPUEfficiency > 0 && pod.CPUEfficiency < 0.50 && pod.CPUCost > 0 {
-			recommended := pod.CPUP95Usage * 1.5 * 1000 // p95 * 1.5 in millicores
+			recommended := pod.CPUP95Usage * analyzer.HeadroomFactor * 1000 // p95 * factor in millicores
 			if recommended < float64(pod.CPURequest) {
 				cpuSavings = pod.CPUCost * (1.0 - recommended/float64(pod.CPURequest))
 			}
@@ -144,7 +144,7 @@ func calculatePodRightSizingSavings(report *analyzer.CostReport) *SavingsOpportu
 		// Memory: recommend only when P95 was measured and is positive
 		if pod.MemP95Available && pod.MemoryP95Usage > 0 &&
 			pod.MemEfficiency > 0 && pod.MemEfficiency < 0.50 && pod.RAMCost > 0 {
-			recommended := float64(pod.MemoryP95Usage) * 1.5
+			recommended := float64(pod.MemoryP95Usage) * analyzer.HeadroomFactor
 			if recommended < float64(pod.MemRequest) {
 				ramSavings = pod.RAMCost * (1.0 - recommended/float64(pod.MemRequest))
 			}
